@@ -3,7 +3,9 @@
 # Run it from your own machine (on the FCUL VPN) or from the login node. See --help.
 set -euo pipefail
 
-HOST="${LASIGE_HOST:-login-node.di.fc.ul.pt}"
+HOST=login-node.di.fc.ul.pt
+LOGIN_USER=""
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/lasige-data/config"
 DEFAULT_DEST=datasets   # relative paths are relative to your cluster home directory
 
 usage() {
@@ -40,18 +42,39 @@ Other:
 
 Running a command again resumes: finished files are skipped, partial ones continue.
 Job logs are in ~/slurm_outputs/. Paths are on the cluster; home is private to you.
-Login node: \$LASIGE_HOST (default: $HOST)
+
+Connection settings (optional), in $CONFIG:
+  host = NAME       login node or SSH alias (default: login-node.di.fc.ul.pt)
+  user = USERNAME   your cluster username, if your SSH config doesn't set it
 EOF
 }
 
 die() { echo "lasige-data: $*" >&2; exit 1; }
+
+# Read as plain key = value, never sourced, so the file can't run code.
+if [ -f "$CONFIG" ]; then
+  while IFS='=' read -r key value || [ -n "$key" ]; do
+    key=$(echo "$key" | tr -d '[:space:]')
+    value=$(echo "$value" | tr -d '[:space:]')
+    case "$key" in
+      ""|\#*) ;;
+      host) HOST=$value ;;
+      user) LOGIN_USER=$value ;;
+      *) die "unknown setting '$key' in $CONFIG" ;;
+    esac
+  done < "$CONFIG"
+fi
+HOST="${LASIGE_HOST:-$HOST}"
+[[ $HOST =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "bad host: $HOST"
+[[ -z $LOGIN_USER || $LOGIN_USER =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || die "bad user: $LOGIN_USER"
+SSH_CMD="ssh -o ConnectTimeout=10${LOGIN_USER:+ -l $LOGIN_USER}"
 
 # Run a shell command on the login node, directly if we are already on it.
 on_login() {
   if [ "$(hostname -s)" = login-node ]; then
     bash -c "$1"
   else
-    ssh -o ConnectTimeout=10 "$HOST" "$1" \
+    $SSH_CMD "$HOST" "$1" \
       || die "command on $HOST failed. If it could not connect, are you on the FCUL VPN?"
   fi
 }
@@ -325,7 +348,7 @@ case "$cmd" in
     on_login "mkdir -p $(printf %q "$DEST")"
     # No -z: compression costs login-node CPU and most datasets are already compressed.
     # With protect-args, a space in --dest stays one path on the remote side.
-    rsync -a --partial --protect-args --info=progress2 --human-readable --bwlimit="$BWLIMIT" \
+    rsync -e "$SSH_CMD" -a --partial --protect-args --info=progress2 --human-readable --bwlimit="$BWLIMIT" \
       --rsync-path='nice -n 19 ionice -c 3 rsync' \
       -- "$src" "$HOST:$DEST/"
     ;;
