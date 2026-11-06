@@ -35,7 +35,7 @@ Paths are on the cluster, and relative ones start at your home.
   Options for all three:
       --token NAME        use a token saved with the token command
       --dest DIR          download here instead of ~/$DEFAULT_DEST
-      --cpus N            parallel downloads (default: 4)
+      --cpus N            CPUs, and parallel files for hf and url (default: 4)
       --time D-HH:MM:SS   time limit (default: 1-00:00:00)
 
 ON YOUR MACHINE: no job. Stays attached until finished.
@@ -43,14 +43,15 @@ ON YOUR MACHINE: no job. Stays attached until finished.
   push PATH [--dest DIR] [--bwlimit RATE]
       Copies a file or folder to ~/$DEFAULT_DEST/BASENAME through the login node,
       at low priority and capped at 20 MB/s unless you set --bwlimit.
-      Replaces files whose contents differ. Never deletes anything on the cluster.
+      Replaces files whose size or date differ. Never deletes other cluster files.
       Run again: copies only what changed.
 
 ANYWHERE
 
   token NAME
-      Saves a read-only access token in a private file in your cluster home,
-      replacing any with that name. Cluster admins could still read it.
+      Saves an access token in a private file in your cluster home, replacing
+      any with that name. Cluster admins could still read it, so use a read-only
+      token.
       To remove: revoke it at the source, then delete
       ~/.config/lasige-data/tokens/NAME on the cluster.
 
