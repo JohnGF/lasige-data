@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# lasige-data: get data onto the LASIGE cluster without loading the login node.
+# Run it from your own machine (on the FCUL VPN) or from the login node. See --help.
+set -euo pipefail
+
+HOST="${LASIGE_HOST:-login-node.di.fc.ul.pt}"
+DEFAULT_DEST=datasets   # relative paths are relative to your cluster home directory
+
+usage() {
+  cat <<EOF
+Usage: lasige-data <command> [options]
+
+Downloads run as a Slurm job on a compute node:
+  hf ORG/NAME           Public Hugging Face repo    -> DEST/ORG/NAME/
+       --type dataset|model|space   (default: dataset)
+       --rev REVISION               (default: main)
+  git URL               Public git repo, shallow    -> DEST/REPO/
+       --ref BRANCH_OR_TAG          (default: the repo's default branch)
+  url URL [URL...]      Public file links           -> DEST/[NAME/]FILE
+       --name NAME                  put the files in a subfolder
+
+  Job options:  --dest DIR (default: ~/$DEFAULT_DEST)  --cpus N (default: 4)
+                --time D-HH:MM:SS (default: 1-00:00:00)
+
+Uploads from your machine go through the login node, so they are throttled:
+  push PATH             Copy a local file or folder -> DEST/BASENAME
+       --dest DIR  (default: ~/$DEFAULT_DEST)
+       --bwlimit RATE               (default: 20m, i.e. 20 MB/s)
+
+Other:
+  status                Your queued jobs and what is in ~/$DEFAULT_DEST
+
+Running a command again resumes: finished files are skipped, partial ones continue.
+Job logs are in ~/slurm_outputs/. Paths are on the cluster; home is private to you.
+Login node: \$LASIGE_HOST (default: $HOST)
+EOF
+}
+
+die() { echo "lasige-data: $*" >&2; exit 1; }
+
+# Run a shell command on the login node, directly if we are already on it.
+on_login() {
+  if [ "$(hostname -s)" = login-node ]; then
+    bash -c "$1"
+  else
+    ssh -o ConnectTimeout=10 "$HOST" "$1" \
+      || die "command on $HOST failed. If it could not connect, are you on the FCUL VPN?"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Functions from here to the next rule run inside the Slurm job.
+# ---------------------------------------------------------------------------
+
+# Download URL to OUT via OUT.part, so OUT only ever exists once complete.
+fetch_one() {
+  local url=$1 out=$2 size=${3:-}
+  if [ -f "$out" ] && { [ -z "$size" ] || [ "$(stat -c %s "$out")" = "$size" ]; }; then
+    echo "[skip] $out"
+    return 0
+  fi
+  mkdir -p "$(dirname "$out")"
+  # A complete .part (job killed just before the rename) would make the server answer 416.
+  if [ -z "$size" ] || [ ! -f "$out.part" ] || [ "$(stat -c %s "$out.part")" != "$size" ]; then
+    if ! curl -fsSL --retry 5 --retry-delay 20 --connect-timeout 30 \
+              --speed-limit 1024 --speed-time 300 -C - -o "$out.part" "$url"; then
+      echo "[FAIL] $out <- $url" >&2
+      return 1
+    fi
+  fi
+  if [ -n "$size" ] && [ "$(stat -c %s "$out.part")" != "$size" ]; then
+    echo "[FAIL] $out: size is $(stat -c %s "$out.part"), expected $size" >&2
+    return 1
+  fi
+  mv -f "$out.part" "$out"
+  echo "[done] $out"
+}
+
+# Fetch every "url<TAB>path<TAB>size" line of LIST under DEST, $JOBS at a time.
+fetch_list() {
+  local list=$1 dest=$2 url path size running=0 failed=0 total
+  total=$(wc -l < "$list")
+  echo "[info] $total file(s), $JOBS at a time"
+  while IFS=$'\t' read -r url path size; do
+    if [ "$running" -ge "$JOBS" ]; then
+      wait -n || failed=$((failed + 1))
+      running=$((running - 1))
+    fi
+    fetch_one "$url" "$dest/$path" "$size" &
+    running=$((running + 1))
+  done < "$list"
+  while [ "$running" -gt 0 ]; do
+    wait -n || failed=$((failed + 1))
+    running=$((running - 1))
+  done
+  if [ "$failed" -gt 0 ]; then
+    echo "[info] $failed of $total failed. Submit the same command again to retry them." >&2
+    return 1
+  fi
+}
+
+job_hf() {
+  local kind=$1 repo=$2 rev=$3 dest=$4 list
+  list=$(mktemp)
+  python3 -I - "$kind" "$repo" "$rev" > "$list" <<'PY'
+import json, re, sys
+import urllib.error, urllib.parse, urllib.request
+
+kind, repo, rev = sys.argv[1:]
+base = "https://huggingface.co"
+quoted_rev = urllib.parse.quote(rev, safe="")
+web_prefix = "" if kind == "model" else f"{kind}s/"
+
+def get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "lasige-data"})
+    return urllib.request.urlopen(req, timeout=60)
+
+try:
+    with get(f"{base}/api/{kind}s/{repo}") as f:
+        info = json.load(f)
+    if info.get("gated"):
+        sys.exit(f"{repo} is gated: it needs a login, and lasige-data only handles public repos")
+    url = f"{base}/api/{kind}s/{repo}/tree/{quoted_rev}?recursive=true"
+    while url:
+        with get(url) as f:
+            for item in json.load(f):
+                if item["type"] != "file":
+                    continue
+                path = item["path"]
+                if path.startswith("/") or ".." in path.split("/") or re.search(r"[\t\n]", path):
+                    sys.exit(f"refusing unsafe path in repo listing: {path!r}")
+                print(f"{base}/{web_prefix}{repo}/resolve/{quoted_rev}/"
+                      f"{urllib.parse.quote(path)}\t{path}\t{item['size']}")
+            next_link = re.search(r'<([^>]+)>;\s*rel="next"', f.headers.get("Link", ""))
+            url = next_link.group(1) if next_link else None
+except urllib.error.HTTPError as err:
+    sys.exit(f"Hugging Face said {err.code} for {kind} {repo} at {rev}: "
+             "wrong name or revision, or the repo is private")
+PY
+  fetch_list "$list" "$dest/$repo"
+  rm -f "$list"
+  du -sh "$dest/$repo"
+}
+
+job_git() {
+  local url=$1 ref=$2 dest=$3 name out pointers
+  name=$(basename "${url%/}" .git)
+  out="$dest/$name"
+  export GIT_TERMINAL_PROMPT=0   # a private repo should fail, not wait for a password
+  mkdir -p "$dest"
+  if [ -d "$out/.git" ]; then
+    git -C "$out" fetch --depth 1 origin "${ref:-HEAD}"
+    git -C "$out" checkout -q FETCH_HEAD
+  elif [ -n "$ref" ]; then
+    git clone --depth 1 --branch "$ref" "$url" "$out"
+  else
+    git clone --depth 1 "$url" "$out"
+  fi
+  # git-lfs is not installed on the cluster, so LFS files arrive as small text pointers.
+  pointers=$({ git -C "$out" grep -lI '^version https://git-lfs' 2>/dev/null || true; } | wc -l)
+  if [ "$pointers" -gt 0 ]; then
+    echo "[warn] $pointers file(s) are Git LFS pointers, not the real data: git-lfs is not installed here." >&2
+  fi
+  du -sh "$out"
+}
+
+job_url() {
+  local dest=$1 url file list
+  shift
+  list=$(mktemp)
+  for url in "$@"; do
+    file=${url%%[?#]*}
+    file=${file##*/}
+    case "$file" in
+      ""|.|..) echo "[FAIL] no file name in $url" >&2; rm -f "$list"; return 1 ;;
+    esac
+    printf '%s\t%s\t\n' "$url" "$file" >> "$list"
+  done
+  fetch_list "$list" "$dest"
+  rm -f "$list"
+  du -sh "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# End of the functions that run inside the job.
+# ---------------------------------------------------------------------------
+
+# submit JOB_NAME FUNCTION ARGS...: send a self-contained job script to sbatch.
+submit() {
+  local name=$1 script jobid
+  shift
+  script=$(
+    echo '#!/bin/bash'
+    echo 'set -euo pipefail'
+    echo 'JOBS="${SLURM_CPUS_PER_TASK:-4}"'
+    declare -f fetch_one fetch_list job_hf job_git job_url
+    echo 'echo "[info] host=$(hostname) job=$SLURM_JOB_ID start=$(date)"'
+    printf '%q ' "$@"
+    echo
+    echo 'echo "[info] finished=$(date)"'
+  )
+  jobid=$(printf '%s\n' "$script" | on_login "mkdir -p \"\$HOME/slurm_outputs\" && sbatch --parsable \
+    --job-name=$(printf %q "$name") --partition=compute --ntasks=1 \
+    --cpus-per-task=$CPUS --mem=2gb --time=$TIME \
+    --chdir=\"\$HOME\" --output=\"\$HOME/slurm_outputs/%x_%j.txt\"")
+  echo "Submitted job $jobid"
+  echo "Log: ~/slurm_outputs/${name}_$jobid.txt"
+  echo "Progress: lasige-data status"
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in -h|--help) usage; exit 0 ;; esac
+
+DEST=$DEFAULT_DEST CPUS=4 TIME=1-00:00:00
+KIND=dataset REV=main REF="" NAME="" BWLIMIT=20m
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dest|--cpus|--time|--type|--rev|--ref|--name|--bwlimit)
+      [ $# -ge 2 ] || die "$1 needs a value"
+      case "$1" in
+        --dest) DEST=$2 ;;
+        --cpus) CPUS=$2 ;;
+        --time) TIME=$2 ;;
+        --type) KIND=$2 ;;
+        --rev) REV=$2 ;;
+        --ref) REF=$2 ;;
+        --name) NAME=$2 ;;
+        --bwlimit) BWLIMIT=$2 ;;
+      esac
+      shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; ARGS+=("$@"); break ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+[[ $CPUS =~ ^[0-9]+$ ]] || die "--cpus must be a number"
+[[ $TIME =~ ^[0-9:-]+$ ]] || die "--time must look like D-HH:MM:SS"
+
+case "$cmd" in
+  hf)
+    [ ${#ARGS[@]} -eq 1 ] || die "hf takes one repo, e.g. lasige-data hf org/name"
+    repo=${ARGS[0]}
+    [[ $repo =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?$ && $repo != *..* ]] || die "bad repo name: $repo"
+    case "$KIND" in dataset|model|space) ;; *) die "--type must be dataset, model or space" ;; esac
+    submit "dl-hf-${repo//\//_}" job_hf "$KIND" "$repo" "$REV" "$DEST"
+    ;;
+  git)
+    [ ${#ARGS[@]} -eq 1 ] || die "git takes one URL"
+    [[ ${ARGS[0]} =~ ^https?:// ]] || die "git needs an http(s) URL, since only public repos are supported"
+    submit "dl-git-$(basename "${ARGS[0]%/}" .git)" job_git "${ARGS[0]}" "$REF" "$DEST"
+    ;;
+  url)
+    [ ${#ARGS[@]} -ge 1 ] || die "url needs at least one link"
+    for u in "${ARGS[@]}"; do
+      [[ $u =~ ^(https?|ftp):// ]] || die "not a download link: $u"
+    done
+    if [ -n "$NAME" ]; then
+      [[ $NAME =~ ^[A-Za-z0-9_.-]+$ && $NAME != *..* ]] || die "bad --name: $NAME"
+      DEST="$DEST/$NAME"
+    fi
+    submit "dl-url-${NAME:-files}" job_url "$DEST" "${ARGS[@]}"
+    ;;
+  push)
+    [ ${#ARGS[@]} -eq 1 ] || die "push takes one local path"
+    src=${ARGS[0]%/}
+    [ -e "$src" ] || die "no such local path: $src"
+    on_login "mkdir -p $(printf %q "$DEST")"
+    # No -z: compression costs login-node CPU and most datasets are already compressed.
+    # With protect-args, a space in --dest stays one path on the remote side.
+    rsync -a --partial --protect-args --info=progress2 --human-readable --bwlimit="$BWLIMIT" \
+      --rsync-path='nice -n 19 ionice -c 3 rsync' \
+      -- "$src" "$HOST:$DEST/"
+    ;;
+  status)
+    on_login "squeue -u \"\$USER\"; echo; du -sh \"\$HOME/$DEFAULT_DEST\"/* 2>/dev/null || echo 'Nothing in ~/$DEFAULT_DEST yet.'"
+    ;;
+  ""|help) usage ;;
+  *) die "unknown command: $cmd (see --help)" ;;
+esac
