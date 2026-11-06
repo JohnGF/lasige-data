@@ -21,13 +21,21 @@ Downloads run as a Slurm job on a compute node:
 
   Job options:  --dest DIR (default: ~/$DEFAULT_DEST)  --cpus N (default: 4)
                 --time D-HH:MM:SS (default: 1-00:00:00)
+                --token NAME  use a token saved with 'lasige-data token', for
+                              private data. hf and url send it as a Bearer
+                              header; git sends it as the HTTPS password.
 
 Uploads from your machine go through the login node, so they are throttled:
   push PATH             Copy a local file or folder -> DEST/BASENAME
        --dest DIR  (default: ~/$DEFAULT_DEST)
        --bwlimit RATE               (default: 20m, i.e. 20 MB/s)
+       Run push from your own machine, not from the login node.
 
 Other:
+  token NAME            Save a read-only access token on the cluster, in a private
+                        file in your home. Asks for it, or reads it from a pipe.
+                        To remove it: revoke it where you created it, then delete
+                        ~/.config/lasige-data/tokens/NAME
   status                Your queued jobs and what is in ~/$DEFAULT_DEST
 
 Running a command again resumes: finished files are skipped, partial ones continue.
@@ -62,8 +70,12 @@ fetch_one() {
   mkdir -p "$(dirname "$out")"
   # A complete .part (job killed just before the rename) would make the server answer 416.
   if [ -z "$size" ] || [ ! -f "$out.part" ] || [ "$(stat -c %s "$out.part")" != "$size" ]; then
+    # printf is a shell builtin and curl only sees a /dev/fd path, so the token stays out
+    # of ps. curl drops the Authorization header if a redirect leaves the host.
     if ! curl -fsSL --retry 5 --retry-delay 20 --connect-timeout 30 \
-              --speed-limit 1024 --speed-time 300 -C - -o "$out.part" "$url"; then
+              --speed-limit 1024 --speed-time 300 -C - -o "$out.part" \
+              -H @<(if [ -n "$TOKEN_FILE" ]; then printf 'Authorization: Bearer %s\n' "$(cat "$TOKEN_FILE")"; fi) \
+              "$url"; then
       echo "[FAIL] $out <- $url" >&2
       return 1
     fi
@@ -103,7 +115,7 @@ job_hf() {
   local kind=$1 repo=$2 rev=$3 dest=$4 list
   list=$(mktemp)
   python3 -I - "$kind" "$repo" "$rev" > "$list" <<'PY'
-import json, re, sys
+import json, os, re, sys
 import urllib.error, urllib.parse, urllib.request
 
 kind, repo, rev = sys.argv[1:]
@@ -111,15 +123,29 @@ base = "https://huggingface.co"
 quoted_rev = urllib.parse.quote(rev, safe="")
 web_prefix = "" if kind == "model" else f"{kind}s/"
 
+token_file = os.environ.get("TOKEN_FILE")
+token = open(token_file).read().strip() if token_file else None
+
+class SameHostAuth(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            new.remove_header("Authorization")
+        return new
+
+opener = urllib.request.build_opener(SameHostAuth)
+
 def get(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "lasige-data"})
-    return urllib.request.urlopen(req, timeout=60)
+    headers = {"User-Agent": "lasige-data"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return opener.open(urllib.request.Request(url, headers=headers), timeout=60)
 
 try:
     with get(f"{base}/api/{kind}s/{repo}") as f:
         info = json.load(f)
-    if info.get("gated"):
-        sys.exit(f"{repo} is gated: it needs a login, and lasige-data only handles public repos")
+    if info.get("gated") and not token:
+        sys.exit(f"{repo} is gated: accept its terms on Hugging Face, then use --token")
     url = f"{base}/api/{kind}s/{repo}/tree/{quoted_rev}?recursive=true"
     while url:
         with get(url) as f:
@@ -135,7 +161,7 @@ try:
             url = next_link.group(1) if next_link else None
 except urllib.error.HTTPError as err:
     sys.exit(f"Hugging Face said {err.code} for {kind} {repo} at {rev}: "
-             "wrong name or revision, or the repo is private")
+             "wrong name or revision, or it is private and needs a valid --token")
 PY
   fetch_list "$list" "$dest/$repo"
   rm -f "$list"
@@ -146,7 +172,22 @@ job_git() {
   local url=$1 ref=$2 dest=$3 name out pointers
   name=$(basename "${url%/}" .git)
   out="$dest/$name"
-  export GIT_TERMINAL_PROMPT=0   # a private repo should fail, not wait for a password
+  export GIT_TERMINAL_PROMPT=0   # missing access should fail, not wait for a password
+  if [ -n "$TOKEN_FILE" ]; then
+    # Git asks this helper for credentials, so the token never reaches .git/config.
+    local askpass
+    askpass=$(mktemp)
+    trap 'rm -f "$askpass"' RETURN
+    cat > "$askpass" <<'ASKPASS'
+#!/bin/sh
+case "$1" in
+  Username*) echo token ;;
+  *) cat "$TOKEN_FILE" ;;
+esac
+ASKPASS
+    chmod 700 "$askpass"
+    export GIT_ASKPASS="$askpass" TOKEN_FILE
+  fi
   mkdir -p "$dest"
   if [ -d "$out/.git" ]; then
     git -C "$out" fetch --depth 1 origin "${ref:-HEAD}"
@@ -193,6 +234,12 @@ submit() {
     echo '#!/bin/bash'
     echo 'set -euo pipefail'
     echo 'JOBS="${SLURM_CPUS_PER_TASK:-4}"'
+    echo 'TOKEN_FILE=""'
+    if [ -n "$TOKEN" ]; then
+      printf 'TOKEN_FILE="$HOME/.config/lasige-data/tokens/%s"\n' "$TOKEN"
+      echo '[ -s "$TOKEN_FILE" ] || { echo "[FAIL] no saved token: $TOKEN_FILE" >&2; exit 1; }'
+      echo 'export TOKEN_FILE'
+    fi
     declare -f fetch_one fetch_list job_hf job_git job_url
     echo 'echo "[info] host=$(hostname) job=$SLURM_JOB_ID start=$(date)"'
     printf '%q ' "$@"
@@ -213,11 +260,11 @@ cmd=${1:-}
 case "$cmd" in -h|--help) usage; exit 0 ;; esac
 
 DEST=$DEFAULT_DEST CPUS=4 TIME=1-00:00:00
-KIND=dataset REV=main REF="" NAME="" BWLIMIT=20m
+KIND=dataset REV=main REF="" NAME="" BWLIMIT=20m TOKEN=""
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dest|--cpus|--time|--type|--rev|--ref|--name|--bwlimit)
+    --dest|--cpus|--time|--type|--rev|--ref|--name|--bwlimit|--token)
       [ $# -ge 2 ] || die "$1 needs a value"
       case "$1" in
         --dest) DEST=$2 ;;
@@ -228,6 +275,7 @@ while [ $# -gt 0 ]; do
         --ref) REF=$2 ;;
         --name) NAME=$2 ;;
         --bwlimit) BWLIMIT=$2 ;;
+        --token) TOKEN=$2 ;;
       esac
       shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -239,6 +287,11 @@ done
 
 [[ $CPUS =~ ^[0-9]+$ ]] || die "--cpus must be a number"
 [[ $TIME =~ ^[0-9:-]+$ ]] || die "--time must look like D-HH:MM:SS"
+[[ -z $TOKEN || $TOKEN =~ ^[A-Za-z0-9_-]+$ ]] || die "--token takes the NAME of a saved token, not the token itself"
+# A password inside a URL would end up in the stored job script, ps and the job log.
+for a in "${ARGS[@]+"${ARGS[@]}"}"; do
+  [[ ! $a =~ ^[a-z]+://[^/]*@ ]] || die "don't put credentials in a URL; use 'lasige-data token' and --token"
+done
 
 case "$cmd" in
   hf)
@@ -265,6 +318,7 @@ case "$cmd" in
     submit "dl-url-${NAME:-files}" job_url "$DEST" "${ARGS[@]}"
     ;;
   push)
+    [ "$(hostname -s)" != login-node ] || die "run push from your own machine, not the login node"
     [ ${#ARGS[@]} -eq 1 ] || die "push takes one local path"
     src=${ARGS[0]%/}
     [ -e "$src" ] || die "no such local path: $src"
@@ -274,6 +328,20 @@ case "$cmd" in
     rsync -a --partial --protect-args --info=progress2 --human-readable --bwlimit="$BWLIMIT" \
       --rsync-path='nice -n 19 ionice -c 3 rsync' \
       -- "$src" "$HOST:$DEST/"
+    ;;
+  token)
+    [ ${#ARGS[@]} -eq 1 ] && [[ ${ARGS[0]} =~ ^[A-Za-z0-9_-]+$ ]] || die "usage: lasige-data token NAME"
+    if [ -t 0 ]; then
+      read -rsp "Token for ${ARGS[0]} (hidden): " secret
+      echo
+    else
+      IFS= read -r secret || true
+    fi
+    [ -n "$secret" ] || die "empty token"
+    printf '%s\n' "$secret" | on_login "umask 077 && mkdir -p \"\$HOME/.config/lasige-data/tokens\" \
+      && chmod 700 \"\$HOME/.config/lasige-data\" \"\$HOME/.config/lasige-data/tokens\" \
+      && cat > \"\$HOME/.config/lasige-data/tokens/${ARGS[0]}\""
+    echo "Saved. Use it with: --token ${ARGS[0]}"
     ;;
   status)
     on_login "squeue -u \"\$USER\"; echo; du -sh \"\$HOME/$DEFAULT_DEST\"/* 2>/dev/null || echo 'Nothing in ~/$DEFAULT_DEST yet.'"
