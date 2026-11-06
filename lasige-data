@@ -9,44 +9,58 @@ CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/lasige-data/config"
 DEFAULT_DEST=datasets   # relative paths are relative to your cluster home directory
 
 usage() {
-  cat <<EOF
-Usage: lasige-data <command> [options]
+  cat <<HELP
+lasige-data: get data onto the LASIGE cluster without loading the login node.
+Needs the FCUL VPN when run from your own machine.
 
-Downloads run as a Slurm job on a compute node:
-  hf ORG/NAME           Public Hugging Face repo    -> DEST/ORG/NAME/
-       --type dataset|model|space   (default: dataset)
-       --rev REVISION               (default: main)
-  git URL               Public git repo, shallow    -> DEST/REPO/
-       --ref BRANCH_OR_TAG          (default: the repo's default branch)
-  url URL [URL...]      Public file links           -> DEST/[NAME/]FILE
-       --name NAME                  put the files in a subfolder
+JOBS: run on a compute node. The command returns once the job is queued, not
+when the download is done. Failures show in the job log, ~/slurm_outputs/.
+Paths are on the cluster, and relative ones start at your home.
 
-  Job options:  --dest DIR (default: ~/$DEFAULT_DEST)  --cpus N (default: 4)
-                --time D-HH:MM:SS (default: 1-00:00:00)
-                --token NAME  use a token saved with 'lasige-data token', for
-                              private data. hf and url send it as a Bearer
-                              header; git sends it as the HTTPS password.
+  hf ORG/NAME [--type dataset|model|space] [--rev REVISION]
+      Downloads a Hugging Face repo to ~/$DEFAULT_DEST/ORG/NAME/.
+      Run again: skips files of the right size, resumes the rest.
 
-Uploads from your machine go through the login node, so they are throttled:
-  push PATH             Copy a local file or folder -> DEST/BASENAME
-       --dest DIR  (default: ~/$DEFAULT_DEST)
-       --bwlimit RATE               (default: 20m, i.e. 20 MB/s)
-       Run push from your own machine, not from the login node.
+  git URL [--ref BRANCH_OR_TAG]
+      Clones the latest commit only, over http(s), to ~/$DEFAULT_DEST/REPO/.
+      Run again: updates to the latest commit.
+      Git LFS files arrive as small pointers (the log warns); use hf for those.
 
-Other:
-  token NAME            Save a read-only access token on the cluster, in a private
-                        file in your home. Asks for it, or reads it from a pipe.
-                        To remove it: revoke it where you created it, then delete
-                        ~/.config/lasige-data/tokens/NAME
-  status                Your queued jobs and what is in ~/$DEFAULT_DEST
+  url URL... [--name NAME]
+      Downloads links to ~/$DEFAULT_DEST/FILE, or ~/$DEFAULT_DEST/NAME/FILE.
+      Run again: skips names that exist, even if the file changed at the source,
+      and resumes partial ones. Contents are not checked: a login page would be
+      saved as if it were the file.
 
-Running a command again resumes: finished files are skipped, partial ones continue.
-Job logs are in ~/slurm_outputs/. Paths are on the cluster; home is private to you.
+  Options for all three:
+      --token NAME        use a token saved with the token command
+      --dest DIR          download here instead of ~/$DEFAULT_DEST
+      --cpus N            parallel downloads (default: 4)
+      --time D-HH:MM:SS   time limit (default: 1-00:00:00)
 
-Connection settings (optional), in $CONFIG:
+ON YOUR MACHINE: no job. Stays attached until finished.
+
+  push PATH [--dest DIR] [--bwlimit RATE]
+      Copies a file or folder to ~/$DEFAULT_DEST/BASENAME through the login node,
+      at low priority and capped at 20 MB/s unless you set --bwlimit.
+      Replaces files whose contents differ. Never deletes anything on the cluster.
+      Run again: copies only what changed.
+
+ANYWHERE
+
+  token NAME
+      Saves a read-only access token in a private file in your cluster home,
+      replacing any with that name. Cluster admins could still read it.
+      To remove: revoke it at the source, then delete
+      ~/.config/lasige-data/tokens/NAME on the cluster.
+
+  status
+      Lists your queued jobs and what is in ~/$DEFAULT_DEST. Changes nothing.
+
+SETTINGS (optional), in $CONFIG:
   host = NAME       login node or SSH alias (default: login-node.di.fc.ul.pt)
   user = USERNAME   your cluster username, if your SSH config doesn't set it
-EOF
+HELP
 }
 
 die() { echo "lasige-data: $*" >&2; exit 1; }
