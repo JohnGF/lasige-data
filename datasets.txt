@@ -1,0 +1,2 @@
+# Datasets for lasige_download.sh, one file per line: <name> <url>
+# Each file goes to ~/datasets/<name>/. Repeat a name to put several files together.
