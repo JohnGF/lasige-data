@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lasige-data: get data onto the LASIGE cluster without loading the login node.
 # Run it from your own machine (on the FCUL VPN) or from the login node. See --help.
-# Author: JohnGF - https://github.com/JohnGF/lasige-data
+# Author: João Garcia Farinha - https://github.com/JohnGF/lasige-data
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
